@@ -1,0 +1,24 @@
+[package]
+edition = "2021"
+name = "MD-Red"
+version = "0.1.0"
+
+[dependencies]
+
+embassy-stm32 = { version = "0.1.0", features = [ "defmt", "stm32f303vc", "unstable-pac", "memory-x", "time-driver-any", "exti"]  }
+defmt = "0.3.5"
+defmt-rtt = "0.4.0"
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.3"
+panic-probe = "0.3.1"
+embassy-time = { version = "0.3.2", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+embassy-executor = { version = "0.6.2", features = ["defmt", "executor-thread", "arch-cortex-m", "integrated-timers"] }
+embassy-sync = "0.6.0"
+embedded-hal = "1.0.0"
+
+
+[patch.crates-io]
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "8b9b3ecd0fd6b8d696c52d0bc455aabf64cdad0e" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "8b9b3ecd0fd6b8d696c52d0bc455aabf64cdad0e" }
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "8b9b3ecd0fd6b8d696c52d0bc455aabf64cdad0e" }
+
