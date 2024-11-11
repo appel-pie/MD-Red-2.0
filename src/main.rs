@@ -5,25 +5,24 @@
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::can::util::NominalBitTiming;
-use embassy_stm32::pac::rcc::vals::Adcpre;
-use embassy_stm32::{adc, init, peripherals::*, peripherals, bind_interrupts, can, Config, rcc};
+use embassy_stm32::{adc, init, peripherals::*, peripherals, bind_interrupts, can, Config, rcc, gpio};
+use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::Can;
 use embassy_stm32::exti::ExtiInput;
-use embassy_stm32::can::{Frame, Id, StandardId};
-use embassy_time::{Delay, Timer, Duration};
-use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed};
-use {defmt_rtt as _, panic_probe as _}; 
+use embassy_stm32::can::{Frame, StandardId};
+use embassy_stm32::peripherals::ADC4;
+use embassy_stm32::time::mhz;
+use embassy_time::Timer;
 use core::num::{NonZeroU16, NonZeroU8};
 use core::sync::atomic::{AtomicU32, Ordering};
-use embassy_stm32::peripherals::ADC4;
-use embassy_stm32::pac;
-use embassy_stm32::time::mhz;
-use embassy_stm32::Peripheral;
+
+use {defmt_rtt as _, panic_probe as _,}; 
+
 
 //////////////mutex includes////////////
-use core::cell::RefCell;
-use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+// use core::cell::RefCell;
+// use embassy_sync::blocking_mutex::Mutex;
+// use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 
 /////////////////interrupt bindings
 bind_interrupts!(struct CanIrqs {
@@ -71,15 +70,23 @@ async fn can_task(mut bus: Can<'static>) {
     }
 }
 
-// #[embassy_executor::task]
-// async fn sensor_task(adc: Adc<'static, ADC4>, ain: &'static AinType) {
-//     Timer::after_millis(50).await;
-//     loop {
-//         // Read the ADC value from the specified pin
-//         let reading = adc.read(& mut ain).await;
-//         info!("ADC reading: {}", reading);
-//     }
-// }
+#[embassy_executor::task]
+async fn sensor_task(mut adc4: Adc<'static, ADC4>, 
+                    mut adc3: Adc<'static, ADC3>,  
+                    mut ain1: AnyAdcChannel<ADC4>, 
+                    mut ain2: AnyAdcChannel<ADC3>) 
+{
+    Timer::after_millis(50).await;
+    loop {
+        // Read the ADC value from the specified pin
+        let reading = adc4.read(& mut ain1).await;
+        info!("AIN1 reading: {}", reading);
+        let reading = adc3.read(&mut ain2).await;
+        info!("AIN2 reading: {}", reading);
+    }
+}
+
+
 
 
 #[embassy_executor::main]
@@ -88,46 +95,26 @@ async fn main(spawner: Spawner) {
     // Initialize and create handle for devicer peripherals
     let mut config = Config::default();
     {
-        config.rcc.hse = Some(rcc::Hse {
-            freq: mhz(32),
-            mode: rcc::HseMode::Oscillator,
-        });
+        config.rcc.hse = Some(rcc::Hse {freq: mhz(32), mode: rcc::HseMode::Oscillator});
 
-        config.rcc.hsi = false;
-
-        config.rcc.pll = Some(rcc::Pll {
-            src: rcc::PllSource::HSE,
-            prediv: rcc::PllPreDiv::DIV8, //sysclock at 64mHz (idk why but it dosent like div2 mul4)
-            mul: rcc::PllMul::MUL16,
-        });
-
+        config.rcc.hsi = false; //disable internal clock 
+        //pll at 64mHz (idk why but it dosent like div2 mul4)
+        config.rcc.pll = Some(rcc::Pll {src: rcc::PllSource::HSE, prediv: rcc::PllPreDiv::DIV8, mul: rcc::PllMul::MUL16});
+        //sysclock gets high speed external clock, 32mHz
         config.rcc.sys = rcc::Sysclk::HSE;
-        config.rcc.ahb_pre =  rcc::AHBPrescaler::DIV4; //////hclk////////// 8mHz
-
-        config.rcc.adc =  rcc::AdcClockSource::Pll(rcc::AdcPllPrescaler::DIV4);
+        //hclk gets sysclk div4: 8mHz
+        config.rcc.ahb_pre =  rcc::AHBPrescaler::DIV4; 
+        //ADC Clocks pll div4: 16mHz    
+        config.rcc.adc =  rcc::AdcClockSource::Pll(rcc::AdcPllPrescaler::DIV4); 
         config.rcc.adc34 =  rcc::AdcClockSource::Pll(rcc::AdcPllPrescaler::DIV4);
-      
-        
-
-        // config.rcc.apb1_pre =  rcc::APBPrescaler::DIV8;
-        // config.rcc.apb2_pre =  rcc::APBPrescaler::DIV4;
-        // config.rcc.adc =  rcc::AdcClockSource::Pll( rcc::AdcPllPrescaler::DIV4);
-
-        /////////////////////////////////////////////////////////old code pre migrate////////////////////////////
-        // config.rcc.hse = Some(mhz(32));
-        // config.rcc.sysclk = Some(mhz(8));
-        // config.rcc.hclk = Some(mhz(8)); //set AHB clk
-        // config.rcc.pclk1 = Some(mhz(8)); //APB1 CLK
-        // config.rcc.pclk2 = Some(mhz(8)); //APB2 CLK
-  
     }
-    let mut p = init(config);
+    let p = init(config);
     info!("configed");
 
     /////////////////////////////Configure Can Peripheral
     let mut car_bus: Can<'static> = Can::new(p.CAN, p.PD0, p.PD1, CanIrqs);
     let canconfig = car_bus.modify_config();
-    canconfig.set_bit_timing(NominalBitTiming{
+    canconfig.set_bit_timing(NominalBitTiming{ //////////////TODO: Fix can for whatever clock its at now
         prescaler: NonZeroU16::new(1).unwrap(),
         seg1: NonZeroU8::new(5).unwrap(),
         seg2: NonZeroU8::new(2).unwrap(),
@@ -138,46 +125,36 @@ async fn main(spawner: Spawner) {
 
     car_bus.enable().await;
     //car_bus.enable_interrupt(TEST); //Todo: remove or implement can interrupt
-    info!("hi");
-    ////////////////////////////Configure ADC peripherals
-    let mut adc3 = adc::Adc::new(p.ADC3, Adc3Irqs);
-    //let mut adc4 = adc::Adc::new(p.ADC4, Adc4Irqs);
-    info!("notreached");
-    
-    // let ain1 = p.PE8;
-    // // inner scope is so that once the mutex is written to, the MutexGuard is dropped, thus the
-    // // Mutex is released
-    // {
-    //     *(AIN1.lock().await) = Some(ain1);
-    // }
 
-    // Configure the button pin and obtain handler.
-   // let on_button: Input<'_, PE2> = Input::new(p.PE2, Pull::None); 
-    let mut on_button: ExtiInput<'_> = ExtiInput::new(p.PE2, p.EXTI2, Pull::None);
+    ////////////////////////////Configure ADC peripherals
+    let adc3 = Adc::new(p.ADC3, Adc3Irqs);
+    let adc4 = Adc::new(p.ADC4, Adc4Irqs);
+
+    let mut on_button: ExtiInput<'_> = ExtiInput::new(p.PE2, p.EXTI2, gpio::Pull::None);
     
     // Spawn tasks
     spawner.spawn(can_task(car_bus)).unwrap();
-    //spawner.spawn(sensor_task(adc4, &AIN1)).unwrap();
+    spawner.spawn(sensor_task(adc4, adc3, p.PE8.degrade_adc(), p.PE9.degrade_adc())).unwrap();
 
-    loop {
-        //info!("main loop begin");
-        //Check if button got pressed
-        // on_button.wait_for_rising_edge().await;
-        // info!("button rising edge detected");
-         Timer::after_millis(100).await;
-        // if on_button.is_high() 
-        // {
-        // info!("State transition");
-        // CAN_MESSAGE.fetch_add(1, Ordering::Relaxed);
-        // }
+    // loop {
+    //     //info!("main loop begin");
+    //     //Check if button got pressed
+    //     // on_button.wait_for_rising_edge().await;
+    //     // info!("button rising edge detected");
+    //      Timer::after_millis(100).await;
+    //     // if on_button.is_high() 
+    //     // {
+    //     // info!("State transition");
+    //     // CAN_MESSAGE.fetch_add(1, Ordering::Relaxed);
+    //     // }
 
-        let result1 = adc3.read(&mut p.PE9).await as u32;
-        let result2 = adc3.read(&mut p.PE10).await as u32;
-        info!("result1: {}, result2: {}", result1, result2);
+    //     let result1 = adc3.read(&mut p.PE9).await as u32;
+    //     let result2 = adc3.read(&mut p.PE10).await as u32;
+    //     info!("result1: {}, result2: {}", result1, result2);
 
-        CAN_MESSAGE.store(result1, Ordering::Relaxed);
-        //info!("adc's read and sent");
-    }
+    //     CAN_MESSAGE.store(result1, Ordering::Relaxed);
+    //     //info!("adc's read and sent");
+    // }
 }
 
 pub fn u32tou8array(data: &u32) -> [u8; 4] {
