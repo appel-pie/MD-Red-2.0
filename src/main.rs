@@ -1,11 +1,10 @@
 #![no_std]
 #![no_main]
 
-use cortex_m::delay;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::can::frame::Envelope;
 use embassy_stm32::can::util::NominalBitTiming;
+use core::num::{NonZeroU16, NonZeroU8}; //used for can bit timings
 use embassy_stm32::{adc, init, peripherals::*, peripherals, bind_interrupts, can, Config, rcc, gpio};
 use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::{Frame, StandardId, Can};
@@ -14,14 +13,14 @@ use embassy_stm32::can::enums::TryReadError;
 use embassy_stm32::peripherals::ADC4;
 use embassy_stm32::time::mhz;
 use embassy_time::Timer;
-use core::num::{NonZeroU16, NonZeroU8};
-use core::sync::atomic::{AtomicU32, Ordering};
-use core::cell::RefCell;
-use {defmt_rtt as _, panic_probe as _,}; 
 
+//mutex & multi-tasking includes
+use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_sync::mutex::Mutex;
-use embassy_sync::blocking_mutex::raw::{ThreadModeRawMutex};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use static_cell::StaticCell;
+//logging
+use {defmt_rtt as _, panic_probe as _,}; 
 
 
 /////////////////interrupt bindings
@@ -43,7 +42,7 @@ bind_interrupts!(struct Adc3Irqs {
 //////////////////////////////////static variables
 static CAN_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
-// Mutex to safely share CAN bus between tasks
+// Mutex type to safely share CAN bus between tasks
 type can_bus_mut_type = Mutex<ThreadModeRawMutex, can::Can<'static>>;
 
 #[embassy_executor::task]
@@ -51,10 +50,10 @@ async fn can_write_task(bus: &'static can_bus_mut_type) {
     info!("CAN Write Task Begin");
     let id = StandardId::new(100).unwrap();
     loop {
-        Timer::after_millis(10).await;
+        Timer::after_millis(50).await;
         let can_frame: Frame = Frame::new_data(id, &u32tou8array(&CAN_MESSAGE.load(Ordering::Relaxed))).unwrap();
-        let mut bus_unlock = bus.lock().await;
-        bus_unlock.write(&can_frame).await;
+        let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
+        bus_unlock.write(&can_frame).await; 
     }
 }
 
@@ -63,17 +62,13 @@ async fn can_read_task(bus: &'static can_bus_mut_type) {
     info!("CAN Read Task Begin");
     loop {
         Timer::after_millis(10).await;
-
-        let mut bus_unlock = bus.lock().await;
-
-        let try_read = bus_unlock.try_read();
-
-        if let  Err(TryReadError::Empty) = try_read{ 
+        let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
+        let try_read = bus_unlock.try_read(); //try read
+        if let  Err(TryReadError::Empty) = try_read{ //if read fn returs empty:: log or nothing
             info!("no messages left");
         }else{
-            info!("recived: {}", try_read.unwrap().frame.data());
+            info!("recived: {}", try_read.unwrap().frame.data()); //if not empty do something with data
         } 
-
     }
 }
 
@@ -86,8 +81,7 @@ async fn sensor_task(mut adc4: Adc<'static, ADC4>,
     Timer::after_millis(50).await; 
     loop {
         Timer::after_millis(100).await;
-        // Read the ADC value from the specified pin
-        let ain1_reading = adc4.read(&mut ain1).await;
+        let ain1_reading = adc4.read(&mut ain1).await;// Read the ADC value from the specified pin
         //info!("AIN1 reading: {}", ain1_reading);
         let ain2_reading = adc3.read(&mut ain2).await;
         //info!("AIN2 reading: {}", ain2_reading);
@@ -122,15 +116,10 @@ async fn main(spawner: Spawner) {
         seg2: NonZeroU8::new(2).unwrap(),
         sync_jump_width: NonZeroU8::new(8).unwrap(),
     });
-    car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, can::filter::Mask32::accept_all());
-
-    car_bus.enable().await;
-
-    static CAN_BUS: StaticCell<can_bus_mut_type> = StaticCell::new();
-
-    let car_bus_mutex = CAN_BUS.init(Mutex::new(car_bus));
-
-
+    car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, can::filter::Mask32::accept_all()); //set can filter
+    car_bus.enable().await;                                                                       //enable can
+    static CAN_BUS_CELL: StaticCell<can_bus_mut_type> = StaticCell::new();//static cell lets us initialize at runtime into memory reserved at compile time
+    let car_bus_mutex = CAN_BUS_CELL.init(Mutex::new(car_bus)); //static cell used to init a new mutex of canbus peri
 
     ////////////////////////////Configure ADC peripherals
     let adc3 = Adc::new(p.ADC3, Adc3Irqs);
