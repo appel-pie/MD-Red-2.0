@@ -2,20 +2,23 @@
     #![no_main]
 
 
+use cortex_m::delay;
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_stm32::can::frame::Envelope;
 use embassy_stm32::can::util::NominalBitTiming;
 use embassy_stm32::{adc, init, peripherals::*, peripherals, bind_interrupts, can, Config, rcc, gpio};
 use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::Can;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::can::{Frame, StandardId};
+use embassy_stm32::can::enums::TryReadError;
+
 use embassy_stm32::peripherals::ADC4;
 use embassy_stm32::time::mhz;
 use embassy_time::Timer;
 use core::num::{NonZeroU16, NonZeroU8};
 use core::sync::atomic::{AtomicU32, Ordering};
-
 use {defmt_rtt as _, panic_probe as _,}; 
 
 
@@ -58,15 +61,17 @@ static CAN_MESSAGE: AtomicU32 = AtomicU32::new(0);
 async fn can_task(mut bus: Can<'static>) {
     info!("can task begin");
     let id = StandardId::new(100).unwrap();
-    Timer::after_secs(1).await;
     loop {  
-        Timer::after_millis(50).await;
-        //info!("can loop start");
-        //let test: [u8; 4] = CAN_MESSAGE.load(Ordering::Relaxed) as [u8; 4];
-        let test = CAN_MESSAGE.load(Ordering::Relaxed);
-        let can_frame: Frame = Frame::new_data(id, &u32tou8array(&test)).unwrap();
+        Timer::after_millis(10).await;
+        let can_frame: Frame = Frame::new_data(id, &u32tou8array(&CAN_MESSAGE.load(Ordering::Relaxed))).unwrap();
         bus.write(&can_frame).await;
-        //info!("sent can!");
+
+        let try_read = bus.try_read();
+        if let  Err(TryReadError::Empty) = try_read{ 
+            info!("no messages left");
+        }else{
+            info!("recived: {}", try_read.unwrap().frame.data());
+        } 
     }
 }
 
@@ -76,13 +81,15 @@ async fn sensor_task(mut adc4: Adc<'static, ADC4>,
                     mut ain1: AnyAdcChannel<ADC4>, 
                     mut ain2: AnyAdcChannel<ADC3>) 
 {
-    Timer::after_millis(50).await;
+    Timer::after_millis(50).await; 
     loop {
+        Timer::after_millis(100).await;
         // Read the ADC value from the specified pin
-        let reading = adc4.read(& mut ain1).await;
-        info!("AIN1 reading: {}", reading);
-        let reading = adc3.read(&mut ain2).await;
-        info!("AIN2 reading: {}", reading);
+        let ain1_reading = adc4.read(& mut ain1).await;
+        //info!("AIN1 reading: {}", ain1_reading);
+        let ain2_reading = adc3.read(&mut ain2).await;
+        //info!("AIN2 reading: {}", ain2_reading);
+        CAN_MESSAGE.store(ain2_reading as u32, Ordering::Relaxed);
     }
 }
 
@@ -114,14 +121,17 @@ async fn main(spawner: Spawner) {
     /////////////////////////////Configure Can Peripheral
     let mut car_bus: Can<'static> = Can::new(p.CAN, p.PD0, p.PD1, CanIrqs);
     let canconfig = car_bus.modify_config();
-    canconfig.set_bit_timing(NominalBitTiming{ //////////////TODO: Fix can for whatever clock its at now
+    canconfig.set_bit_timing(NominalBitTiming{ ////////////// Note: bit timings need manual settings, not sure why
         prescaler: NonZeroU16::new(1).unwrap(),
         seg1: NonZeroU8::new(5).unwrap(),
         seg2: NonZeroU8::new(2).unwrap(),
         sync_jump_width: NonZeroU8::new(8).unwrap(),
-    }); //http://www.bittiming.can-wiki.info/#bxCAN
+    });
+     //http://www.bittiming.can-wiki.info/#bxCAN
     // BitRate accuracy    Pre-scaler  Number of time quanta   seg 1   Seg 2	Sample Point    Register
     // 1000	0.0000	       1	       8	                   5	   2	    75.0	        0x00140000
+    car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, can::filter::Mask32::accept_all());
+    
 
     car_bus.enable().await;
     //car_bus.enable_interrupt(TEST); //Todo: remove or implement can interrupt
@@ -134,7 +144,9 @@ async fn main(spawner: Spawner) {
     
     // Spawn tasks
     spawner.spawn(can_task(car_bus)).unwrap();
-    spawner.spawn(sensor_task(adc4, adc3, p.PE8.degrade_adc(), p.PE9.degrade_adc())).unwrap();
+    spawner.spawn(sensor_task(adc4, adc3, 
+                p.PE8.degrade_adc(), 
+                p.PE9.degrade_adc())).unwrap();
 
     // loop {
     //     //info!("main loop begin");
