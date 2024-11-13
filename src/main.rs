@@ -7,14 +7,14 @@ use embassy_stm32::can::filter::{ListEntry16, BankConfig};
 use embassy_stm32::can::util::NominalBitTiming;
 use embassy_stm32::exti::ExtiInput;
 use core::num::{NonZeroU16, NonZeroU8}; //used for can bit timings
-use embassy_stm32::{adc, init, peripherals::*, peripherals, bind_interrupts, can, Config, rcc, gpio};
+use embassy_stm32::{adc, bind_interrupts, can, gpio, init, peripherals::{self, *}, rcc, timer, Config};
 use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::{filter, Can, Frame, StandardId};
 use embassy_stm32::can::enums::TryReadError;
 
 
 use embassy_stm32::peripherals::ADC4;
-use embassy_stm32::time::mhz;
+use embassy_stm32::time::{mhz, hz};
 use embassy_time::Timer;
 
 //mutex & multi-tasking includes
@@ -173,6 +173,13 @@ async fn main(spawner: Spawner) {
     ///////////////////////////Configure input button with interupt
     let mut rtd_button: ExtiInput<'_> = ExtiInput::new(p.PE2, p.EXTI2, gpio::Pull::None);
 
+    //////////////////////////Configure RTD sound pin
+    let rtd_sound_pin = Some(timer::simple_pwm::PwmPin::new_ch1(p.PA11, gpio::OutputType::PushPull));
+    let mut buzzer_button = timer::simple_pwm::SimplePwm::new(p.TIM4, rtd_sound_pin, Option::None, Option::None, Option::None, hz(261), timer::low_level::CountingMode::CenterAlignedBothInterrupts);
+    buzzer_button.ch1().enable();
+    Timer::after_millis(200).await; //try beep
+    buzzer_button.ch1().disable();
+
     // Spawn tasks
     spawner.spawn(can_write_task(car_bus_mutex)).unwrap();
     spawner.spawn(can_read_task(car_bus_mutex)).unwrap();
@@ -185,8 +192,8 @@ async fn main(spawner: Spawner) {
         info!("button rising edge detected");
         Timer::after_millis(100).await;
         if rtd_button.is_high() && 
-            !RTD_STATE.load(Ordering::Relaxed) && 
-            (u32tou8array(&PDM_STATES.load(Ordering::Relaxed))[5] == 255) //check what pdm puts for booleans
+        !RTD_STATE.load(Ordering::Relaxed) && 
+        (u32tou8array(&PDM_STATES.load(Ordering::Relaxed))[5] == 255) //check what pdm puts for booleans
         {
             //todo: the beeping thing
             RTD_STATE.store(true, Ordering::Relaxed);
