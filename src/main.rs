@@ -12,12 +12,13 @@ use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::{filter, Can, Frame, StandardId};
 use embassy_stm32::can::enums::TryReadError;
 
+
 use embassy_stm32::peripherals::ADC4;
 use embassy_stm32::time::mhz;
 use embassy_time::Timer;
 
 //mutex & multi-tasking includes
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use static_cell::StaticCell;
@@ -40,6 +41,9 @@ bind_interrupts!(struct Adc3Irqs {
     ADC3 => adc::InterruptHandler<ADC3>;
 });
 
+/////////////////////////////////Firmware global state data
+static RTD_STATE: AtomicBool = AtomicBool::new(false);
+
 //////////////////////////////////Send Msg Data
 static TORQUE_DATA: AtomicU32 = AtomicU32::new(0);
 static FAILURES: AtomicU32 = AtomicU32::new(0);
@@ -48,14 +52,14 @@ static FAILURES: AtomicU32 = AtomicU32::new(0);
 static PDM_STATES: AtomicU32 = AtomicU32::new(0);
 static PDM_CURRENTS: AtomicU32 = AtomicU32::new(0);
 
-/////////////////////////////////Can Addresses
-const CANID_MC_RX: u16 = 0x192;              // Address to send message to MC
+/////////////////////////////////Can Addresses: TX
+const CANID_MC_TORQUE: u16 = 0x192;              // Address to send message to MC
+////////////////////////////////Can Adresses: RX
 const CANID_BRAKE: u16 = 0x245;              // Send Brake on can id
 const CANID_FAILURES: u16 = 0x250;           // Send failures on can id
 const CANID_ORIONBMS: u16 = 0x3B;            // Receive OrionBMS Main Channel
 const CANID_ORIONBMS2: u16 = 0x6B2;          // Receive OrionBMS secondary channel
 const CANID_PDMRESET: u16 = 0x522;           // Receive PDM Water Pump Current and diag
-const CANID_M150_SPEED: u16 = 0x400;         // M150 Speed
 const CANID_PDMSTATUS: u16 = 0x520;          // Receive pdm vehicle states and faults
 const CANID_M150_TEMPERATURE: u16 = 0x502;   //Receive tractive system temps from m150
 
@@ -64,11 +68,9 @@ type can_bus_mut_type = Mutex<ThreadModeRawMutex, can::Can<'static>>;
 
 #[embassy_executor::task]
 async fn can_write_task(bus: &'static can_bus_mut_type) {
-    info!("CAN Write Task Begin");
-    let torque_id = StandardId::new(100).unwrap();
     loop {
         Timer::after_millis(50).await;
-        let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_RX).unwrap(), &u32tou8array(&TORQUE_DATA.load(Ordering::Relaxed))).unwrap();
+        let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &u32tou8array(&TORQUE_DATA.load(Ordering::Relaxed))).unwrap();
         let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
         bus_unlock.write(&can_frame).await; 
     }
@@ -84,7 +86,13 @@ async fn can_read_task(bus: &'static can_bus_mut_type) {
         loop{
             let try_read = bus_unlock.try_read(); //try read
             if try_read.is_ok() == true{
-                info!("recived: {}", try_read.unwrap().frame.data());
+                let readframe = try_read.unwrap().frame;
+                ////////////////////////////////PDM STATUS RECIVE
+                if *readframe.header().id() == StandardId::new(CANID_PDMSTATUS).unwrap().into(){
+                    let data: &[u8] = readframe.data();
+                    PDM_STATES.store( u8arraytou32(data), Ordering::Relaxed)
+                }
+                ////////////////////////////////
             }else{
                 break;
             }
@@ -140,14 +148,19 @@ async fn main(spawner: Spawner) {
     //car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, can::filter::Mask32::accept_all()); //set can filter
     //let filterconfig = filter::Mask16::frames_with_std_id(can::StandardId::new(CANID_BRAKE).unwrap(), can::StandardId::new(0x7FF).unwrap())
     
-    let canfiltconfig = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_BRAKE).unwrap()), 
+    let canfiltbank1 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_BRAKE).unwrap()), 
                                                         ListEntry16::data_frames_with_id(StandardId::new(CANID_FAILURES).unwrap()),
-                                                        //ListEntry16::remote_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap()),
-                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS2).unwrap()),
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS).unwrap()),
                                                         ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap())]);
 
-    car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltconfig);
-    
+    let canfiltbank2 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMRESET).unwrap()), 
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS2).unwrap()),
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap()),
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_M150_TEMPERATURE).unwrap())]);
+
+
+    car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltbank1);
+    car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltbank2);
     
     car_bus.enable().await;                                                                       //enable can
     static CAN_BUS_CELL: StaticCell<can_bus_mut_type> = StaticCell::new();//static cell lets us initialize at runtime into memory reserved at compile time
@@ -171,15 +184,28 @@ async fn main(spawner: Spawner) {
         rtd_button.wait_for_rising_edge().await;
         info!("button rising edge detected");
         Timer::after_millis(100).await;
-        if rtd_button.is_high() 
+        if rtd_button.is_high() && 
+            !RTD_STATE.load(Ordering::Relaxed) && 
+            (u32tou8array(&PDM_STATES.load(Ordering::Relaxed))[5] == 255) //check what pdm puts for booleans
         {
-        info!("State transition");
+            //todo: the beeping thing
+            RTD_STATE.store(true, Ordering::Relaxed);
         }
     }
 }
 
 pub fn u32tou8array(data: &u32) -> [u8; 4] {
-    let mut res = [0; 4];
-    res[..4].copy_from_slice(&data.to_le_bytes()); //copies the memory representation in slices, little endian byte order
-    res //returns result
+    let mut output = [0; 4];
+    output[..4].copy_from_slice(&data.to_le_bytes()); //copies the memory representation in slices, little endian byte order
+    output //returns result
+}
+
+pub fn u8arraytou32(input_array: &[u8]) -> u32{
+    let mut output: u32 = 0;
+    let mut i = 0;
+    for byte in input_array {
+        output = ((*byte as u32) << i*8) | output;
+        i+=1;
+    };
+    output //return
 }
