@@ -1,29 +1,28 @@
-    #![no_std]
-    #![no_main]
-
+#![no_std]
+#![no_main]
 
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_stm32::can::filter::{ListEntry16, BankConfig};
 use embassy_stm32::can::util::NominalBitTiming;
-use embassy_stm32::pac::rcc::vals::Adcpre;
-use embassy_stm32::{adc, init, peripherals::*, peripherals, bind_interrupts, can, Config, rcc};
-use embassy_stm32::can::Can;
 use embassy_stm32::exti::ExtiInput;
-use embassy_stm32::can::{Frame, Id, StandardId};
-use embassy_time::{Delay, Timer, Duration};
-use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed};
-use {defmt_rtt as _, panic_probe as _}; 
-use core::num::{NonZeroU16, NonZeroU8};
-use core::sync::atomic::{AtomicU32, Ordering};
-use embassy_stm32::peripherals::ADC4;
-use embassy_stm32::pac;
-use embassy_stm32::time::mhz;
-use embassy_stm32::Peripheral;
+use core::num::{NonZeroU16, NonZeroU8}; //used for can bit timings
+use embassy_stm32::{adc, init, peripherals::*, peripherals, bind_interrupts, can, Config, rcc, gpio};
+use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
+use embassy_stm32::can::{filter, Can, Frame, StandardId};
+use embassy_stm32::can::enums::TryReadError;
 
-//////////////mutex includes////////////
-use core::cell::RefCell;
-use embassy_sync::blocking_mutex::Mutex;
+use embassy_stm32::peripherals::ADC4;
+use embassy_stm32::time::mhz;
+use embassy_time::Timer;
+
+//mutex & multi-tasking includes
+use core::sync::atomic::{AtomicU32, Ordering};
+use embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use static_cell::StaticCell;
+//logging
+use {defmt_rtt as _, panic_probe as _,}; 
 
 /////////////////interrupt bindings
 bind_interrupts!(struct CanIrqs {
@@ -40,162 +39,147 @@ bind_interrupts!(struct Adc4Irqs {
 bind_interrupts!(struct Adc3Irqs {
     ADC3 => adc::InterruptHandler<ADC3>;
 });
-/////////////////can interupt create
-//static TEST: can::bxcan::Interrupt = can::bxcan::Interrupt::Fifo0Full;
 
-//////////////////////////////////static variables
-static CAN_MESSAGE: AtomicU32 = AtomicU32::new(0);
+//////////////////////////////////Send Msg Data
+static TORQUE_DATA: AtomicU32 = AtomicU32::new(0);
+static FAILURES: AtomicU32 = AtomicU32::new(0);
 
-//type AinType = Mutex<ThreadModeRawMutex, Option<adc::AdcPin<'static, adc::AnyAdcChannel>>>;
-//static AIN1: AinType = Mutex::new(None);
+/////////////////////////////////Recive Msg Data
+static PDM_STATES: AtomicU32 = AtomicU32::new(0);
+static PDM_CURRENTS: AtomicU32 = AtomicU32::new(0);
 
-// type PinType = Mutex<ThreadModeRawMutex, Option<Output<'static, AnyPin>>>;
-// static start_button: PinType = Mutex::new(None);
-// static throttle_sens_1: PinType = Mutex::new(None);
+/////////////////////////////////Can Addresses
+const CANID_MC_RX: u16 = 0x192;              // Address to send message to MC
+const CANID_BRAKE: u16 = 0x245;              // Send Brake on can id
+const CANID_FAILURES: u16 = 0x250;           // Send failures on can id
+const CANID_ORIONBMS: u16 = 0x3B;            // Receive OrionBMS Main Channel
+const CANID_ORIONBMS2: u16 = 0x6B2;          // Receive OrionBMS secondary channel
+const CANID_PDMRESET: u16 = 0x522;           // Receive PDM Water Pump Current and diag
+const CANID_M150_SPEED: u16 = 0x400;         // M150 Speed
+const CANID_PDMSTATUS: u16 = 0x520;          // Receive pdm vehicle states and faults
+const CANID_M150_TEMPERATURE: u16 = 0x502;   //Receive tractive system temps from m150
 
-
+// Mutex type to safely share CAN bus between tasks
+type can_bus_mut_type = Mutex<ThreadModeRawMutex, can::Can<'static>>;
 
 #[embassy_executor::task]
-async fn can_task(mut bus: Can<'static>) {
-    info!("can task begin");
-    let id = StandardId::new(100).unwrap();
-    Timer::after_secs(1).await;
-    loop {  
+async fn can_write_task(bus: &'static can_bus_mut_type) {
+    info!("CAN Write Task Begin");
+    let torque_id = StandardId::new(100).unwrap();
+    loop {
         Timer::after_millis(50).await;
-        //info!("can loop start");
-        //let test: [u8; 4] = CAN_MESSAGE.load(Ordering::Relaxed) as [u8; 4];
-        let test = CAN_MESSAGE.load(Ordering::Relaxed);
-        let can_frame: Frame = Frame::new_data(id, &u32tou8array(&test)).unwrap();
-        bus.write(&can_frame).await;
-        //info!("sent can!");
+        let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_RX).unwrap(), &u32tou8array(&TORQUE_DATA.load(Ordering::Relaxed))).unwrap();
+        let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
+        bus_unlock.write(&can_frame).await; 
     }
 }
 
-// #[embassy_executor::task]
-// async fn sensor_task(adc: Adc<'static, ADC4>, ain: &'static AinType) {
-//     Timer::after_millis(50).await;
-//     loop {
-//         // Read the ADC value from the specified pin
-//         let reading = adc.read(& mut ain).await;
-//         info!("ADC reading: {}", reading);
-//     }
-// }
+#[embassy_executor::task]
+async fn can_read_task(bus: &'static can_bus_mut_type) {
+    info!("CAN Read Task Begin");
+    loop {
+        {
+        let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
+        // let try_read = bus_unlock.try_read(); //try read
+        loop{
+            let try_read = bus_unlock.try_read(); //try read
+            if try_read.is_ok() == true{
+                info!("recived: {}", try_read.unwrap().frame.data());
+            }else{
+                break;
+            }
+        }
+        }
+        Timer::after_micros(100).await;
+    }
+}
 
+#[embassy_executor::task]
+async fn sensor_task(mut adc4: Adc<'static, ADC4>, 
+                    mut adc3: Adc<'static, ADC3>,  
+                    mut ain1: AnyAdcChannel<ADC4>, 
+                    mut ain2: AnyAdcChannel<ADC3>) 
+{
+    loop {
+        Timer::after_millis(100).await;
+        let ain1_reading = adc4.read(&mut ain1).await;// Read the ADC value from the specified pin
+        //info!("AIN1 reading: {}", ain1_reading);
+        let ain2_reading = adc3.read(&mut ain2).await;
+        //info!("AIN2 reading: {}", ain2_reading);
+        TORQUE_DATA.store(ain2_reading as u32, Ordering::Relaxed);
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    info!("main entry");
-    // Initialize and create handle for devicer peripherals
+    info!("Main entry");
+
+    // Initialize and create handle for device peripherals
     let mut config = Config::default();
     {
-        config.rcc.hse = Some(rcc::Hse {
-            freq: mhz(32),
-            mode: rcc::HseMode::Oscillator,
-        });
-
-        config.rcc.hsi = false;
-
-        config.rcc.pll = Some(rcc::Pll {
-            src: rcc::PllSource::HSE,
-            prediv: rcc::PllPreDiv::DIV8, //sysclock at 64mHz (idk why but it dosent like div2 mul4)
-            mul: rcc::PllMul::MUL16,
-        });
-
+        config.rcc.hse = Some(rcc::Hse {freq: mhz(32), mode: rcc::HseMode::Oscillator});
+        config.rcc.hsi = false; //disable internal clock 
+        config.rcc.pll = Some(rcc::Pll {src: rcc::PllSource::HSE, prediv: rcc::PllPreDiv::DIV8, mul: rcc::PllMul::MUL16});
         config.rcc.sys = rcc::Sysclk::HSE;
-        config.rcc.ahb_pre =  rcc::AHBPrescaler::DIV4; //////hclk////////// 8mHz
-
-        config.rcc.adc =  rcc::AdcClockSource::Pll(rcc::AdcPllPrescaler::DIV4);
+        config.rcc.ahb_pre =  rcc::AHBPrescaler::DIV4; 
+        config.rcc.adc =  rcc::AdcClockSource::Pll(rcc::AdcPllPrescaler::DIV4); 
         config.rcc.adc34 =  rcc::AdcClockSource::Pll(rcc::AdcPllPrescaler::DIV4);
-      
-        
-
-        // config.rcc.apb1_pre =  rcc::APBPrescaler::DIV8;
-        // config.rcc.apb2_pre =  rcc::APBPrescaler::DIV4;
-        // config.rcc.adc =  rcc::AdcClockSource::Pll( rcc::AdcPllPrescaler::DIV4);
-
-        /////////////////////////////////////////////////////////old code pre migrate////////////////////////////
-        // config.rcc.hse = Some(mhz(32));
-        // config.rcc.sysclk = Some(mhz(8));
-        // config.rcc.hclk = Some(mhz(8)); //set AHB clk
-        // config.rcc.pclk1 = Some(mhz(8)); //APB1 CLK
-        // config.rcc.pclk2 = Some(mhz(8)); //APB2 CLK
-  
     }
-    let mut p = init(config);
-    info!("configed");
+    let p = init(config);
+    info!("Configured");
 
-    /////////////////////////////Configure Can Peripheral
+    /////////////////////////////Configure CAN Peripheral
     let mut car_bus: Can<'static> = Can::new(p.CAN, p.PD0, p.PD1, CanIrqs);
     let canconfig = car_bus.modify_config();
-    canconfig.set_bit_timing(NominalBitTiming{
+    canconfig.set_bit_timing(NominalBitTiming {
         prescaler: NonZeroU16::new(1).unwrap(),
         seg1: NonZeroU8::new(5).unwrap(),
         seg2: NonZeroU8::new(2).unwrap(),
         sync_jump_width: NonZeroU8::new(8).unwrap(),
-    }); //http://www.bittiming.can-wiki.info/#bxCAN
-    // BitRate accuracy    Pre-scaler  Number of time quanta   seg 1   Seg 2	Sample Point    Register
-    // 1000	0.0000	       1	       8	                   5	   2	    75.0	        0x00140000
+    });
+    //car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, can::filter::Mask32::accept_all()); //set can filter
+    //let filterconfig = filter::Mask16::frames_with_std_id(can::StandardId::new(CANID_BRAKE).unwrap(), can::StandardId::new(0x7FF).unwrap())
+    
+    let canfiltconfig = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_BRAKE).unwrap()), 
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_FAILURES).unwrap()),
+                                                        //ListEntry16::remote_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap()),
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS2).unwrap()),
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap())]);
 
-    car_bus.enable().await;
-    //car_bus.enable_interrupt(TEST); //Todo: remove or implement can interrupt
-    info!("hi");
+    car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltconfig);
+    
+    
+    car_bus.enable().await;                                                                       //enable can
+    static CAN_BUS_CELL: StaticCell<can_bus_mut_type> = StaticCell::new();//static cell lets us initialize at runtime into memory reserved at compile time
+    let car_bus_mutex = CAN_BUS_CELL.init(Mutex::new(car_bus)); //static cell used to init a new mutex of canbus peri
+
     ////////////////////////////Configure ADC peripherals
-    let mut adc3 = adc::Adc::new(p.ADC3, Adc3Irqs);
-    //let mut adc4 = adc::Adc::new(p.ADC4, Adc4Irqs);
-    info!("notreached");
-    
-    // let ain1 = p.PE8;
-    // // inner scope is so that once the mutex is written to, the MutexGuard is dropped, thus the
-    // // Mutex is released
-    // {
-    //     *(AIN1.lock().await) = Some(ain1);
-    // }
+    let adc3 = Adc::new(p.ADC3, Adc3Irqs);
+    let adc4 = Adc::new(p.ADC4, Adc4Irqs);
 
-    // Configure the button pin and obtain handler.
-   // let on_button: Input<'_, PE2> = Input::new(p.PE2, Pull::None); 
-    let mut on_button: ExtiInput<'_> = ExtiInput::new(p.PE2, p.EXTI2, Pull::None);
-    
+    ///////////////////////////Configure input button with interupt
+    let mut rtd_button: ExtiInput<'_> = ExtiInput::new(p.PE2, p.EXTI2, gpio::Pull::None);
+
     // Spawn tasks
-    spawner.spawn(can_task(car_bus)).unwrap();
-    //spawner.spawn(sensor_task(adc4, &AIN1)).unwrap();
+    spawner.spawn(can_write_task(car_bus_mutex)).unwrap();
+    spawner.spawn(can_read_task(car_bus_mutex)).unwrap();
+    spawner.spawn(sensor_task(adc4, adc3, p.PE8.degrade_adc(), p.PE9.degrade_adc())).unwrap();
 
+    // Main loop: state transitions
     loop {
-        //info!("main loop begin");
         //Check if button got pressed
-        // on_button.wait_for_rising_edge().await;
-        // info!("button rising edge detected");
-         Timer::after_millis(100).await;
-        // if on_button.is_high() 
-        // {
-        // info!("State transition");
-        // CAN_MESSAGE.fetch_add(1, Ordering::Relaxed);
-        // }
-
-        let result1 = adc3.read(&mut p.PE9).await as u32;
-        let result2 = adc3.read(&mut p.PE10).await as u32;
-        info!("result1: {}, result2: {}", result1, result2);
-
-        CAN_MESSAGE.store(result1, Ordering::Relaxed);
-        //info!("adc's read and sent");
+        rtd_button.wait_for_rising_edge().await;
+        info!("button rising edge detected");
+        Timer::after_millis(100).await;
+        if rtd_button.is_high() 
+        {
+        info!("State transition");
+        }
     }
 }
 
 pub fn u32tou8array(data: &u32) -> [u8; 4] {
     let mut res = [0; 4];
-    res[..4].copy_from_slice(&data.to_le_bytes()); //copies the memory representatin in slices, little endian byte order
+    res[..4].copy_from_slice(&data.to_le_bytes()); //copies the memory representation in slices, little endian byte order
     res //returns result
 }
-
-// pub fn arrayu8tou32(array: &[u8; 4]) -> u32 {
-//     let mut res: u32 = 0;
-// }
-
-// pub struct Sensor<'a, T>{
-//     sensor_limits: SensorCharacteristics,
-//     pin: &'a mut Peripheral,
-// }
-
-// pub struct SensorCharacteristics{
-//     upper_range: u32,
-//     lower_range: u32, 
-// }
