@@ -11,6 +11,7 @@ use embassy_stm32::{adc, bind_interrupts, can, gpio, init, peripherals::{self, *
 use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::{filter, Can, Frame, StandardId};
 use embassy_stm32::can::enums::TryReadError;
+use bitbybit::bitfield;
 
 
 use embassy_stm32::peripherals::ADC4;
@@ -18,7 +19,7 @@ use embassy_stm32::time::{mhz, hz};
 use embassy_time::Timer;
 
 //mutex & multi-tasking includes
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, AtomicU8, AtomicU32, AtomicI16};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use static_cell::StaticCell;
@@ -45,12 +46,21 @@ bind_interrupts!(struct Adc3Irqs {
 static RTD_STATE: AtomicBool = AtomicBool::new(false);
 
 //////////////////////////////////Send Msg Data
-static TORQUE_DATA: AtomicU32 = AtomicU32::new(0);
-static FAILURES: AtomicU32 = AtomicU32::new(0);
+static TORQUE_DATA: AtomicI16 = AtomicI16::new(0);
+// static TORQUE_DATA1: AtomicU8 = AtomicU8::new(0);
+// static TORQUE_DATA2: AtomicU8 = AtomicU8::new(0);
+// static TORQUE_DATA3: AtomicU8 = AtomicU8::new(0);
+// static TORQUE_DATA4: AtomicU8 = AtomicU8::new(0);
+// static TORQUE_DATA5: AtomicU8 = AtomicU8::new(0);
+// static TORQUE_DATA6: AtomicU8 = AtomicU8::new(0);
+// static TORQUE_DATA7: AtomicU8 = AtomicU8::new(0);
+
+//static FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /////////////////////////////////Recive Msg Data
-static PDM_STATES: AtomicU32 = AtomicU32::new(0);
-static PDM_CURRENTS: AtomicU32 = AtomicU32::new(0);
+static PDM_STATES: AtomicU8 = AtomicU8::new(0);
+
+//static PDM_CURRENTS: AtomicU64 = AtomicU64::new(0);
 
 /////////////////////////////////Can Addresses: TX
 const CANID_MC_TORQUE: u16 = 0x192;              // Address to send message to MC
@@ -70,7 +80,14 @@ type can_bus_mut_type = Mutex<ThreadModeRawMutex, can::Can<'static>>;
 async fn can_write_task(bus: &'static can_bus_mut_type) {
     loop {
         Timer::after_millis(50).await;
-        let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &u32tou8array(&TORQUE_DATA.load(Ordering::Relaxed))).unwrap();
+        let mut motor_broadcast = i16tou8array(&TORQUE_DATA.load(Ordering::Relaxed), 0);
+        if RTD_STATE.load(Ordering::Relaxed){
+            motor_broadcast[4] = 1; //DIRECTION
+            motor_broadcast[5] = 1; //ENABLE
+        }else{
+            motor_broadcast[5] = 0; //DISABLE
+        }
+        let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &motor_broadcast).unwrap();
         let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
         bus_unlock.write(&can_frame).await; 
     }
@@ -90,9 +107,9 @@ async fn can_read_task(bus: &'static can_bus_mut_type) {
                 ////////////////////////////////PDM STATUS RECIVE
                 if *readframe.header().id() == StandardId::new(CANID_PDMSTATUS).unwrap().into(){
                     let data: &[u8] = readframe.data();
-                    PDM_STATES.store( u8arraytou32(data), Ordering::Relaxed)
+                    let pdmstates_transcribed = PdmStates::new_with_raw_value(0).with_hvs_bms_fault(data[0]!=0).with_hvs_pdoc_fault(data[1]!=0).with_imd_imd_fault(data[2]!=0).with_hvs_imd_fault(data[3]!=0).with_standby(data[4]!=0).with_hv_precharged(data[5]!=0).with_bcm_control(data[6]!=0).with_shutdown_lock(data[7]!=0);
+                    PDM_STATES.store(pdmstates_transcribed.raw_value, Ordering::Relaxed)
                 }
-                ////////////////////////////////
             }else{
                 break;
             }
@@ -114,7 +131,7 @@ async fn sensor_task(mut adc4: Adc<'static, ADC4>,
         //info!("AIN1 reading: {}", ain1_reading);
         let ain2_reading = adc3.read(&mut ain2).await;
         //info!("AIN2 reading: {}", ain2_reading);
-        TORQUE_DATA.store(ain2_reading as u32, Ordering::Relaxed);
+        TORQUE_DATA.store(ain2_reading as i16, Ordering::Relaxed);
     }
 }
 
@@ -163,6 +180,10 @@ async fn main(spawner: Spawner) {
     car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltbank2);
     
     car_bus.enable().await;                                                                       //enable can
+    let mc_init_data: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let mc_init_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &mc_init_data).unwrap();
+    car_bus.write(&mc_init_frame).await; 
+
     static CAN_BUS_CELL: StaticCell<can_bus_mut_type> = StaticCell::new();//static cell lets us initialize at runtime into memory reserved at compile time
     let car_bus_mutex = CAN_BUS_CELL.init(Mutex::new(car_bus)); //static cell used to init a new mutex of canbus peri
 
@@ -171,14 +192,14 @@ async fn main(spawner: Spawner) {
     let adc4 = Adc::new(p.ADC4, Adc4Irqs);
 
     ///////////////////////////Configure input button with interupt
-    let mut rtd_button: ExtiInput<'_> = ExtiInput::new(p.PE2, p.EXTI2, gpio::Pull::None);
+    let mut rtd_button: ExtiInput<'_> = ExtiInput::new(p.PB9, p.EXTI9, gpio::Pull::None);
 
-    //////////////////////////Configure RTD sound pin
-    let rtd_sound_pin = Some(timer::simple_pwm::PwmPin::new_ch1(p.PA11, gpio::OutputType::PushPull));
-    let mut buzzer_button = timer::simple_pwm::SimplePwm::new(p.TIM4, rtd_sound_pin, Option::None, Option::None, Option::None, hz(261), timer::low_level::CountingMode::CenterAlignedBothInterrupts);
-    buzzer_button.ch1().enable();
-    Timer::after_millis(200).await; //try beep
-    buzzer_button.ch1().disable();
+    ////////////////////////Configure RTD sound pin: pwm not required
+    let mut beep_pin = gpio::Output::new(p.PB8,gpio::Level::Low, gpio::Speed::Medium);
+
+    beep_pin.set_high();
+    Timer::after_millis(50).await;
+    beep_pin.set_low();
 
     // Spawn tasks
     spawner.spawn(can_write_task(car_bus_mutex)).unwrap();
@@ -188,31 +209,76 @@ async fn main(spawner: Spawner) {
     // Main loop: state transitions
     loop {
         //Check if button got pressed
-        rtd_button.wait_for_rising_edge().await;
+        rtd_button.wait_for_falling_edge().await;
         info!("button rising edge detected");
-        Timer::after_millis(100).await;
-        if rtd_button.is_high() && 
-        !RTD_STATE.load(Ordering::Relaxed) && 
-        (u32tou8array(&PDM_STATES.load(Ordering::Relaxed))[5] == 255) //check what pdm puts for booleans
+        let prechargecheck = PdmStates::new_with_raw_value(PDM_STATES.load(Ordering::Relaxed));
+        Timer::after_millis(200).await; //button press for 1/5 of a second
+        if rtd_button.is_low() &&       //button still press
+            !RTD_STATE.load(Ordering::Relaxed) &&  //not already rtd
+            prechargecheck.hv_precharged() //if Precharged (can message from pdm)
         {
             //todo: the beeping thing
             RTD_STATE.store(true, Ordering::Relaxed);
+            beep_pin.set_high();
+            Timer::after_millis(500).await;
+            beep_pin.set_low();
+            Timer::after_millis(100).await;
+            beep_pin.set_high();
+            Timer::after_millis(500).await;
+            beep_pin.set_low();
+            Timer::after_millis(100).await;
+            beep_pin.set_high();
+            Timer::after_millis(500).await;
+            beep_pin.set_low();
+        }else if rtd_button.is_low() && RTD_STATE.load(Ordering::Relaxed){
+            RTD_STATE.store(false, Ordering::Relaxed);
+            beep_pin.set_high();
+            Timer::after_millis(500).await;
+            beep_pin.set_low();
         }
     }
 }
 
-pub fn u32tou8array(data: &u32) -> [u8; 4] {
-    let mut output = [0; 4];
-    output[..4].copy_from_slice(&data.to_le_bytes()); //copies the memory representation in slices, little endian byte order
+pub fn u64tou8array(data: &u32) -> [u8; 8] {
+    let mut output = [0; 8];
+    output[..8].copy_from_slice(&data.to_le_bytes()); //copies the memory representation in slices, little endian byte order
     output //returns result
 }
 
-pub fn u8arraytou32(input_array: &[u8]) -> u32{
-    let mut output: u32 = 0;
-    let mut i = 0;
+pub fn i16tou8array(data: &i16, offset_bytes: u8) -> [u8; 8] {
+    let mut output = [0; 8];
+    let temp = *data as i64;
+    let temp = temp <<8*offset_bytes;
+    output[..8].copy_from_slice(&temp.to_le_bytes()); //copies the memory representation in slices, little endian byte order
+    output //returns result
+}
+
+pub fn u8arraytou64(input_array: &[u8]) -> u64{
+    let mut output: u64 = 0;
+    let mut i: u8 = 0;
     for byte in input_array {
-        output = ((*byte as u32) << i*8) | output;
+        output = ((*byte as u64) << i*8) | output;
         i+=1;
     };
     output //return
+}
+
+#[bitfield(u8)]
+struct PdmStates {
+    #[bit(0, rw)]
+    hvs_bms_fault: bool,
+    #[bit(1, rw)]
+    hvs_pdoc_fault: bool,
+    #[bit(2, rw)]
+    imd_imd_fault: bool,
+    #[bit(3, rw)]
+    hvs_imd_fault: bool,
+    #[bit(4, rw)]
+    standby: bool,
+    #[bit(0, rw)]
+    hv_precharged: bool,
+    #[bit(0, rw)]
+    bcm_control: bool,
+    #[bit(0, rw)]
+    shutdown_lock: bool,
 }
