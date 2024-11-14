@@ -88,8 +88,10 @@ async fn can_write_task(bus: &'static can_bus_mut_type) {
             motor_broadcast[5] = 0; //DISABLE
         }
         let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &motor_broadcast).unwrap();
-        let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
-        bus_unlock.write(&can_frame).await; 
+        {   //make sure mutex lock scope is reduced
+            let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
+            bus_unlock.write(&can_frame).await; 
+        }
     }
 }
 
@@ -97,9 +99,8 @@ async fn can_write_task(bus: &'static can_bus_mut_type) {
 async fn can_read_task(bus: &'static can_bus_mut_type) {
     info!("CAN Read Task Begin");
     loop {
-        {
+        { //nested for mutex lock scope: timer is outside 
         let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
-        // let try_read = bus_unlock.try_read(); //try read
         loop{
             let try_read = bus_unlock.try_read(); //try read
             if try_read.is_ok() == true{
@@ -111,7 +112,7 @@ async fn can_read_task(bus: &'static can_bus_mut_type) {
                     PDM_STATES.store(pdmstates_transcribed.raw_value, Ordering::Relaxed)
                 }
             }else{
-                break;
+                break; //breaks inner loop -> mutex dropped -> async wait
             }
         }
         }
