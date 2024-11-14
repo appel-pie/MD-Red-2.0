@@ -7,16 +7,14 @@ use embassy_stm32::can::filter::{ListEntry16, BankConfig};
 use embassy_stm32::can::util::NominalBitTiming;
 use embassy_stm32::exti::ExtiInput;
 use core::num::{NonZeroU16, NonZeroU8}; //used for can bit timings
-use embassy_stm32::{adc, bind_interrupts, can, gpio, init, peripherals::{self, *}, rcc, timer, Config};
+use embassy_stm32::{adc, bind_interrupts, can, gpio, init, peripherals::{self, *}, rcc, Config};
 use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
-use embassy_stm32::can::{filter, Can, Frame, StandardId};
-use embassy_stm32::can::enums::TryReadError;
+use embassy_stm32::can::{Can, Frame, StandardId};
 use bitbybit::bitfield;
-
-
 use embassy_stm32::peripherals::ADC4;
-use embassy_stm32::time::{mhz, hz};
+use embassy_stm32::time::{mhz};
 use embassy_time::Timer;
+use arbitrary_int::{u1, u13};
 
 //mutex & multi-tasking includes
 use core::sync::atomic::{AtomicBool, Ordering, AtomicU8, AtomicU32, AtomicI16};
@@ -47,22 +45,11 @@ bind_interrupts!(struct Adc3Irqs {
 /////////////////////////////////Firmware global state data
 static RTD_STATE: AtomicBool = AtomicBool::new(false);
 
-//////////////////////////////////Send Msg Data
-static TORQUE_DATA: AtomicI16 = AtomicI16::new(0);
-// static TORQUE_DATA1: AtomicU8 = AtomicU8::new(0);
-// static TORQUE_DATA2: AtomicU8 = AtomicU8::new(0);
-// static TORQUE_DATA3: AtomicU8 = AtomicU8::new(0);
-// static TORQUE_DATA4: AtomicU8 = AtomicU8::new(0);
-// static TORQUE_DATA5: AtomicU8 = AtomicU8::new(0);
-// static TORQUE_DATA6: AtomicU8 = AtomicU8::new(0);
-// static TORQUE_DATA7: AtomicU8 = AtomicU8::new(0);
-
-//static FAILURES: AtomicU64 = AtomicU64::new(0);
-
 /////////////////////////////////Recive Msg Data
 static PDM_STATES: PubSubChannel<ThreadModeRawMutex, u64, 2, 2, 1> = PubSubChannel::new();
 
-//static PDM_CURRENTS: AtomicU64 = AtomicU64::new(0);
+////////////////////////////////Send Msg Data
+static PM150_COMMAND: PubSubChannel<ThreadModeRawMutex, u64, 2, 1, 2> = PubSubChannel::new();
 
 /////////////////////////////////Can Addresses: TX
 const CANID_MC_TORQUE: u16 = 0x192;              // Address to send message to MC
@@ -76,42 +63,14 @@ const CANID_PDMSTATUS: u16 = 0x520;          // Receive pdm vehicle states and f
 const CANID_M150_TEMPERATURE: u16 = 0x502;   //Receive tractive system temps from m150
 
 // Mutex type to safely share CAN bus between tasks
-type can_bus_mut_type = Mutex<ThreadModeRawMutex, can::Can<'static>>;
-
-
-#[bitfield(u64)]
-struct PdmStatesStruct {
-    #[bits(0..=7, rw)]
-    hvs_bms_fault: u8,
-
-    #[bits(8..=15, rw)]
-    hvs_pdoc_fault: u8,
-
-    #[bits(16..=23, rw)]
-    imd_imd_fault: u8,
-
-    #[bits(24..=31, rw)]
-    hvs_imd_fault: u8,
-
-    #[bits(32..=39, rw)]
-    standby: u8,
-
-    #[bits(40..=47, rw)]
-    hv_precharged: u8,
-
-    #[bits(48..=55, rw)]
-    bcm_control: u8,
-
-    #[bits(56..=63, rw)]
-    shutdown_lock: u8,
-}
-
+type CanBusMutType = Mutex<ThreadModeRawMutex, can::Can<'static>>;
 
 #[embassy_executor::task]
-async fn can_write_task(bus: &'static can_bus_mut_type) {
+async fn can_write_task(bus: &'static CanBusMutType) {
+    let mut torque_command_channel = PM150_COMMAND.subscriber().unwrap();
     loop {
         Timer::after_millis(50).await;
-        let mut motor_broadcast = i16tou8array(&TORQUE_DATA.load(Ordering::Relaxed), 0);
+        let mut motor_broadcast = u64tou8array(&torque_command_channel.next_message_pure().await);
         if RTD_STATE.load(Ordering::Relaxed){
             motor_broadcast[4] = 1; //DIRECTION
             motor_broadcast[5] = 1; //ENABLE
@@ -127,7 +86,7 @@ async fn can_write_task(bus: &'static can_bus_mut_type) {
 }
 
 #[embassy_executor::task]
-async fn can_read_task(bus: &'static can_bus_mut_type) {
+async fn can_read_task(bus: &'static CanBusMutType) {
     info!("CAN Read Task Begin");
     let pdm_states_publish = PDM_STATES.publisher().unwrap();
     loop {
@@ -156,13 +115,24 @@ async fn sensor_task(mut adc4: Adc<'static, ADC4>,
                     mut ain1: AnyAdcChannel<ADC4>, 
                     mut ain2: AnyAdcChannel<ADC3>) 
 {
+let mc_torque_channel = PM150_COMMAND.publisher().unwrap();
+let mut command_message = McMessageStruct::default();
+let mut brake_throttle_fault = false;
+mc_torque_channel.publish(command_message.raw_value).await;
+
     loop {
         Timer::after_millis(100).await;
         let ain1_reading = adc4.read(&mut ain1).await;// Read the ADC value from the specified pin
         //info!("AIN1 reading: {}", ain1_reading);
         let ain2_reading = adc3.read(&mut ain2).await;
         //info!("AIN2 reading: {}", ain2_reading);
-        TORQUE_DATA.store(ain2_reading as i16, Ordering::Relaxed);
+        command_message = command_message.with_torque_command(((ain1_reading + ain2_reading/2)) as i16);
+        if RTD_STATE.load(Ordering::Relaxed) && !brake_throttle_fault{
+            command_message = command_message.with_inverter_enable(true.into()); //enable inverter
+        }else{
+            command_message = command_message.with_inverter_enable(false.into()); //disable inverter
+        }
+        mc_torque_channel.publish(command_message.raw_value).await;
     }
 }
 
@@ -209,13 +179,9 @@ async fn main(spawner: Spawner) {
 
     car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltbank1);
     car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltbank2);
-    
     car_bus.enable().await;                                                                       //enable can
-    let mc_init_data: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
-    let mc_init_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &mc_init_data).unwrap();
-    car_bus.write(&mc_init_frame).await; 
 
-    static CAN_BUS_CELL: StaticCell<can_bus_mut_type> = StaticCell::new();//static cell lets us initialize at runtime into memory reserved at compile time
+    static CAN_BUS_CELL: StaticCell<CanBusMutType> = StaticCell::new();//static cell lets us initialize at runtime into memory reserved at compile time
     let car_bus_mutex = CAN_BUS_CELL.init(Mutex::new(car_bus)); //static cell used to init a new mutex of canbus peri
 
     ////////////////////////////Configure ADC peripherals
@@ -272,7 +238,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
-pub fn u64tou8array(data: &u32) -> [u8; 8] {
+pub fn u64tou8array(data: &u64) -> [u8; 8] {
     let mut output = [0; 8];
     output[..8].copy_from_slice(&data.to_le_bytes()); //copies the memory representation in slices, little endian byte order
     output //returns result
@@ -295,3 +261,58 @@ pub fn i16tou8array(data: &i16, offset_bytes: u8) -> [u8; 8] {
     output[..8].copy_from_slice(&temp.to_le_bytes()); //copies the memory representation in slices, little endian byte order
     output //returns result
 }
+
+#[bitfield(u64)]
+struct PdmStatesStruct {
+    #[bits(0..=7, rw)]
+    hvs_bms_fault: u8,
+
+    #[bits(8..=15, rw)]
+    hvs_pdoc_fault: u8,
+
+    #[bits(16..=23, rw)]
+    imd_imd_fault: u8,
+
+    #[bits(24..=31, rw)]
+    hvs_imd_fault: u8,
+
+    #[bits(32..=39, rw)]
+    standby: u8,
+
+    #[bits(40..=47, rw)]
+    hv_precharged: u8,
+
+    #[bits(48..=55, rw)]
+    bcm_control: u8,
+
+    #[bits(56..=63, rw)]
+    shutdown_lock: u8,
+}
+
+#[bitfield(u64, default = 4096)] //0000 0000 0000 0000 0001 0000 0000 0000 0000 (inverter forward: byte 4 =1)
+struct McMessageStruct {
+    #[bits(0..=15, rw)] /////I think this chip will do little endian right?
+    torque_command: i16,
+
+    #[bits(16..=31, rw)]
+    speed_command: i16,
+
+    #[bits(32..=39, rw)]
+    forwards_direction: u8,
+
+    #[bit(40, rw)] //byte 5, bits 0, 1, 2
+    inverter_enable: u1,
+
+    #[bit(41, rw)]
+    inverter_discharge: u1,
+
+    #[bit(42, rw)]
+    speed_mode_enable: u1,
+
+    #[bits(43..=55, rw)]
+    unused: u13,
+
+    #[bits(56..=63, rw)]
+    shutdown_lock: u8,
+}
+
