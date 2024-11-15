@@ -12,12 +12,12 @@ use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::{Can, Frame, StandardId};
 use bitbybit::bitfield;
 use embassy_stm32::peripherals::ADC4;
-use embassy_stm32::time::{mhz};
+use embassy_stm32::time::mhz;
 use embassy_time::Timer;
 use arbitrary_int::{u1, u13};
 
 //mutex & multi-tasking includes
-use core::sync::atomic::{AtomicBool, Ordering, AtomicU8, AtomicU32, AtomicI16};
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use static_cell::StaticCell;
@@ -53,12 +53,13 @@ static PM150_COMMAND: PubSubChannel<ThreadModeRawMutex, u64, 2, 1, 2> = PubSubCh
 
 /////////////////////////////////Can Addresses: TX
 const CANID_MC_TORQUE: u16 = 0x192;              // Address to send message to MC
-////////////////////////////////Can Adresses: RX
 const CANID_BRAKE: u16 = 0x245;              // Send Brake on can id
+////////////////////////////////Can Adresses: RX
+
 const CANID_FAILURES: u16 = 0x250;           // Send failures on can id
 const CANID_ORIONBMS: u16 = 0x3B;            // Receive OrionBMS Main Channel
 const CANID_ORIONBMS2: u16 = 0x6B2;          // Receive OrionBMS secondary channel
-const CANID_PDMRESET: u16 = 0x522;           // Receive PDM Water Pump Current and diag
+const CANID_PDMDATA: u16 = 0x522;           // Receive PDM Water Pump Current and diag
 const CANID_PDMSTATUS: u16 = 0x520;          // Receive pdm vehicle states and faults
 const CANID_M150_TEMPERATURE: u16 = 0x502;   //Receive tractive system temps from m150
 
@@ -67,16 +68,11 @@ type CanBusMutType = Mutex<ThreadModeRawMutex, can::Can<'static>>;
 
 #[embassy_executor::task]
 async fn can_write_task(bus: &'static CanBusMutType) {
+    info!("CAN Write Task Begin");
     let mut torque_command_channel = PM150_COMMAND.subscriber().unwrap();
     loop {
         Timer::after_millis(50).await;
-        let mut motor_broadcast = u64tou8array(&torque_command_channel.next_message_pure().await);
-        if RTD_STATE.load(Ordering::Relaxed){
-            motor_broadcast[4] = 1; //DIRECTION
-            motor_broadcast[5] = 1; //ENABLE
-        }else{
-            motor_broadcast[5] = 0; //DISABLE
-        }
+        let motor_broadcast = u64tou8array(&torque_command_channel.next_message_pure().await);
         let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &motor_broadcast).unwrap();
         {   //make sure mutex lock scope is reduced
             let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
@@ -98,14 +94,21 @@ async fn can_read_task(bus: &'static CanBusMutType) {
                 let readframe = try_read.unwrap().frame;
                 ////////////////////////////////PDM STATUS RECIVE
                 if *readframe.header().id() == StandardId::new(CANID_PDMSTATUS).unwrap().into(){
-                    pdm_states_publish.publish(u8arraytou64( readframe.data())).await;
+                    pdm_states_publish.publish_immediate(u8arraytou64( readframe.data()));
+                    info!("pdm state writted");
+                    if RTD_STATE.load(Ordering::Relaxed) == true && PdmStatesStruct::new_with_raw_value(u8arraytou64(readframe.data())).hv_precharged() == 0{
+                        RTD_STATE.store(false, Ordering::Relaxed); 
+                        info!("shutdown detected");
+                    }//shutdown detected: immediate rtd set low. This is because i dont want to write some interrup and the other state transition data is all on button pressed interrupt.
+                }else{
+                    continue;
                 }
             }else{
                 break; //breaks inner loop -> mutex dropped -> async wait
             }
         }
         }
-        Timer::after_micros(100).await;
+        Timer::after_millis(1).await;
     }
 }
 
@@ -118,10 +121,9 @@ async fn sensor_task(mut adc4: Adc<'static, ADC4>,
 let mc_torque_channel = PM150_COMMAND.publisher().unwrap();
 let mut command_message = McMessageStruct::default();
 let mut brake_throttle_fault = false;
-mc_torque_channel.publish(command_message.raw_value).await;
-
+mc_torque_channel.publish_immediate(command_message.raw_value);
     loop {
-        Timer::after_millis(100).await;
+        Timer::after_millis(50).await;
         let ain1_reading = adc4.read(&mut ain1).await;// Read the ADC value from the specified pin
         //info!("AIN1 reading: {}", ain1_reading);
         let ain2_reading = adc3.read(&mut ain2).await;
@@ -132,7 +134,7 @@ mc_torque_channel.publish(command_message.raw_value).await;
         }else{
             command_message = command_message.with_inverter_enable(false.into()); //disable inverter
         }
-        mc_torque_channel.publish(command_message.raw_value).await;
+        mc_torque_channel.publish_immediate(command_message.raw_value);
     }
 }
 
@@ -166,15 +168,15 @@ async fn main(spawner: Spawner) {
     //car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, can::filter::Mask32::accept_all()); //set can filter
     //let filterconfig = filter::Mask16::frames_with_std_id(can::StandardId::new(CANID_BRAKE).unwrap(), can::StandardId::new(0x7FF).unwrap())
     
-    let canfiltbank1 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_BRAKE).unwrap()), 
-                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_FAILURES).unwrap()),
+    let canfiltbank1 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_FAILURES).unwrap()),
                                                         ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS).unwrap()),
-                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap())]);
-
-    let canfiltbank2 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMRESET).unwrap()), 
                                                         ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS2).unwrap()),
-                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap()),
-                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_M150_TEMPERATURE).unwrap())]);
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMDATA).unwrap())]);
+
+    let canfiltbank2 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap()),
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_M150_TEMPERATURE).unwrap()), 
+                                                        ListEntry16::data_frames_with_id(StandardId::ZERO), //placehodlerd
+                                                        ListEntry16::data_frames_with_id(StandardId::ZERO)]);
 
 
     car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, canfiltbank1);
@@ -204,13 +206,17 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sensor_task(adc4, adc3, p.PE8.degrade_adc(), p.PE9.degrade_adc())).unwrap();
 
     let mut pdmdata = PDM_STATES.subscriber().unwrap();
-    // Main loop: state transitions
+    let mut pdmstates =  PdmStatesStruct::default();
+
     loop {
         //Check if button got pressed
         rtd_button.wait_for_falling_edge().await;
         info!("button rising edge detected");
-        let pdmstates = PdmStatesStruct::new_with_raw_value(pdmdata.try_next_message_pure().unwrap());
-        Timer::after_millis(200).await; //button press for 1/5 of a second
+        let test = pdmdata.try_next_message_pure();
+        if test.is_some(){
+            pdmstates = PdmStatesStruct::new_with_raw_value(test.unwrap());
+        }
+        Timer::after_millis(500).await; //button press for 1/5 of a second
         if rtd_button.is_low() &&       //button still press
             !RTD_STATE.load(Ordering::Relaxed) &&  //not already rtd
             pdmstates.hv_precharged() != 0 //if Precharged (can message from pdm)
@@ -235,6 +241,7 @@ async fn main(spawner: Spawner) {
             Timer::after_millis(500).await;
             beep_pin.set_low();
         }
+
     }
 }
 
@@ -262,7 +269,7 @@ pub fn i16tou8array(data: &i16, offset_bytes: u8) -> [u8; 8] {
     output //returns result
 }
 
-#[bitfield(u64)]
+#[bitfield(u64, default = 0)]
 struct PdmStatesStruct {
     #[bits(0..=7, rw)]
     hvs_bms_fault: u8,
@@ -315,4 +322,3 @@ struct McMessageStruct {
     #[bits(56..=63, rw)]
     shutdown_lock: u8,
 }
-
