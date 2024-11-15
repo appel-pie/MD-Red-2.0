@@ -6,6 +6,7 @@ version = 3
 name = "MD-Red"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "bitbybit",
  "cortex-m",
  "cortex-m-rt",
