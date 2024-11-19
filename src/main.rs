@@ -7,12 +7,12 @@ use embassy_stm32::can::filter::{ListEntry16, BankConfig};
 use embassy_stm32::can::util::NominalBitTiming;
 use embassy_stm32::exti::ExtiInput;
 use core::num::{NonZeroU16, NonZeroU8}; //used for can bit timings
-use embassy_stm32::{adc, bind_interrupts, can, gpio, init, peripherals::{self, *}, rcc, Config};
+use embassy_stm32::{adc, bind_interrupts, can, gpio, timer, init, peripherals::{self, *}, rcc, Config};
 use embassy_stm32::adc::{AdcChannel, Adc, AnyAdcChannel};
 use embassy_stm32::can::{Can, Frame, StandardId};
 use bitbybit::bitfield;
 use embassy_stm32::peripherals::ADC4;
-use embassy_stm32::time::mhz;
+use embassy_stm32::time::{hz, mhz};
 use embassy_time::Timer;
 use arbitrary_int::{u1, u13};
 
@@ -48,15 +48,18 @@ static RTD_STATE: AtomicBool = AtomicBool::new(false);
 /////////////////////////////////Recive Msg Data
 static PDM_STATES: PubSubChannel<ThreadModeRawMutex, u64, 2, 2, 1> = PubSubChannel::new();
 
-////////////////////////////////Send Msg Data
+////////////////////////////////Torque Msg Data
 static PM150_COMMAND: PubSubChannel<ThreadModeRawMutex, u64, 2, 1, 2> = PubSubChannel::new();
+
+////////////////////////////////VCU Data for send
+static VCU_DATA: PubSubChannel<ThreadModeRawMutex, u64, 2, 1, 1> = PubSubChannel::new();
+
 
 /////////////////////////////////Can Addresses: TX
 const CANID_MC_TORQUE: u16 = 0x192;              // Address to send message to MC
-const CANID_BRAKE: u16 = 0x245;              // Send Brake on can id
-////////////////////////////////Can Adresses: RX
+const CANID_VCU_DATA: u16 = 0x250;              // Send Failures and Brake on can id
 
-const CANID_FAILURES: u16 = 0x250;           // Send failures on can id
+////////////////////////////////Can Adresses: RX
 const CANID_ORIONBMS: u16 = 0x3B;            // Receive OrionBMS Main Channel
 const CANID_ORIONBMS2: u16 = 0x6B2;          // Receive OrionBMS secondary channel
 const CANID_PDMDATA: u16 = 0x522;           // Receive PDM Water Pump Current and diag
@@ -67,19 +70,35 @@ const CANID_M150_TEMPERATURE: u16 = 0x502;   //Receive tractive system temps fro
 type CanBusMutType = Mutex<ThreadModeRawMutex, can::Can<'static>>;
 
 #[embassy_executor::task]
-async fn can_write_task(bus: &'static CanBusMutType) {
-    info!("CAN Write Task Begin");
+async fn can_write_torque(bus: &'static CanBusMutType) {
+    info!("CAN Write Torque Task Begin");
     let mut torque_command_channel = PM150_COMMAND.subscriber().unwrap();
     loop {
-        Timer::after_millis(50).await;
+        Timer::after_millis(1000/50).await;
         let motor_broadcast = u64tou8array(&torque_command_channel.next_message_pure().await);
         let can_frame: Frame = Frame::new_data(StandardId::new(CANID_MC_TORQUE).unwrap(), &motor_broadcast).unwrap();
         {   //make sure mutex lock scope is reduced
-            let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
-            bus_unlock.write(&can_frame).await; 
+            let mut unlocked_bus: embassy_sync::mutex::MutexGuard<'_, ThreadModeRawMutex, Can<'_>> = bus.lock().await; //waits for canbus peri to be free
+            unlocked_bus.write(&can_frame).await; 
         }
     }
 }
+
+async fn can_write_vcu_data(bus: &'static CanBusMutType) {
+    info!("CAN Write VCU Data Task Begin");
+    let mut vcu_data_channel = VCU_DATA.subscriber().unwrap();
+    loop {
+        Timer::after_millis(1000/20).await;
+        let vcu_data_broadcast = u64tou8array(&vcu_data_channel.next_message_pure().await);
+        let can_frame = Frame::new_data(StandardId::new(CANID_VCU_DATA).unwrap(), &vcu_data_broadcast).unwrap();
+        {
+            let mut unlocked_bus = bus.lock().await;
+            unlocked_bus.write(&can_frame).await;
+        }
+    }
+}
+
+
 
 #[embassy_executor::task]
 async fn can_read_task(bus: &'static CanBusMutType) {
@@ -121,6 +140,7 @@ async fn sensor_task(mut adc4: Adc<'static, ADC4>,
 let mc_torque_channel = PM150_COMMAND.publisher().unwrap();
 let mut command_message = McMessageStruct::default();
 let mut brake_throttle_fault = false;
+
 mc_torque_channel.publish_immediate(command_message.raw_value);
     loop {
         Timer::after_millis(50).await;
@@ -168,10 +188,10 @@ async fn main(spawner: Spawner) {
     //car_bus.modify_filters().enable_bank(0, can::Fifo::Fifo0, can::filter::Mask32::accept_all()); //set can filter
     //let filterconfig = filter::Mask16::frames_with_std_id(can::StandardId::new(CANID_BRAKE).unwrap(), can::StandardId::new(0x7FF).unwrap())
     
-    let canfiltbank1 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_FAILURES).unwrap()),
-                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS).unwrap()),
+    let canfiltbank1 = BankConfig::List16([ ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS).unwrap()),
                                                         ListEntry16::data_frames_with_id(StandardId::new(CANID_ORIONBMS2).unwrap()),
-                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMDATA).unwrap())]);
+                                                        ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMDATA).unwrap()),
+                                                        ListEntry16::data_frames_with_id(StandardId::ZERO)]);
 
     let canfiltbank2 = BankConfig::List16([ListEntry16::data_frames_with_id(StandardId::new(CANID_PDMSTATUS).unwrap()),
                                                         ListEntry16::data_frames_with_id(StandardId::new(CANID_M150_TEMPERATURE).unwrap()), 
@@ -194,14 +214,11 @@ async fn main(spawner: Spawner) {
     let mut rtd_button: ExtiInput<'_> = ExtiInput::new(p.PB9, p.EXTI9, gpio::Pull::None);
 
     ////////////////////////Configure RTD sound pin: pwm not required
-    let mut beep_pin = gpio::Output::new(p.PB8,gpio::Level::Low, gpio::Speed::Medium);
-
-    beep_pin.set_high();
-    Timer::after_millis(50).await;
-    beep_pin.set_low();
+    let rtd_sound_pin = Some(timer::simple_pwm::PwmPin::new_ch1(p.PA11, gpio::OutputType::PushPull));
+    let mut buzzer_button = timer::simple_pwm::SimplePwm::new(p.TIM4, rtd_sound_pin, Option::None, Option::None, Option::None, hz(1), timer::low_level::CountingMode::CenterAlignedBothInterrupts);
 
     // Spawn tasks
-    spawner.spawn(can_write_task(car_bus_mutex)).unwrap();
+    spawner.spawn(can_write_torque(car_bus_mutex)).unwrap();
     spawner.spawn(can_read_task(car_bus_mutex)).unwrap();
     spawner.spawn(sensor_task(adc4, adc3, p.PE8.degrade_adc(), p.PE9.degrade_adc())).unwrap();
 
@@ -221,25 +238,15 @@ async fn main(spawner: Spawner) {
             !RTD_STATE.load(Ordering::Relaxed) &&  //not already rtd
             pdmstates.hv_precharged() != 0 //if Precharged (can message from pdm)
         {
-            //todo: the beeping thing
-            RTD_STATE.store(true, Ordering::Relaxed);
-            beep_pin.set_high();
-            Timer::after_millis(500).await;
-            beep_pin.set_low();
-            Timer::after_millis(100).await;
-            beep_pin.set_high();
-            Timer::after_millis(500).await;
-            beep_pin.set_low();
-            Timer::after_millis(100).await;
-            beep_pin.set_high();
-            Timer::after_millis(500).await;
-            beep_pin.set_low();
+            buzzer_button.ch1().enable();
+            Timer::after_secs(3).await; //beep 3
+            buzzer_button.ch1().disable();
 
         }else if rtd_button.is_low() && RTD_STATE.load(Ordering::Relaxed){
             RTD_STATE.store(false, Ordering::Relaxed);
-            beep_pin.set_high();
-            Timer::after_millis(500).await;
-            beep_pin.set_low();
+            buzzer_button.ch1().enable();
+            Timer::after_secs(1).await; //beep 1
+            buzzer_button.ch1().disable();
         }
 
     }
@@ -321,4 +328,46 @@ struct McMessageStruct {
 
     #[bits(56..=63, rw)]
     shutdown_lock: u8,
+}
+
+#[bitfield(u64, default = 0)]
+struct VcuDataStruct {
+    #[bits(0..=15, rw)]
+    front_brake: u16,
+
+    #[bits(16..=31, rw)]
+    rear_brake: u16,
+
+    #[bits(32..=39, rw)]
+    throttle_pedal_1: u8,
+
+    #[bits(40..=47, rw)]
+    throttle_pedal_2: u8,
+
+    #[bits(48..=55, rw)]
+    spare: u8,
+
+    #[bit(56, rw)]
+    brake_throttle_fault: u1,
+
+    #[bit(57, rw)]
+    throttle_1_sensor_fault: u1,
+
+    #[bit(58, rw)]
+    throttle_2_sensor_fault: u1,
+
+    #[bit(59, rw)]
+    brake_1_sensor_fault: u1,
+
+    #[bit(60, rw)]
+    brake_2_sensor_fault: u1,
+
+    #[bit(61, rw)]
+    throttle_sensors_disagree: u1,
+
+    #[bit(62, rw)]
+    rtd_state: u1,
+
+    #[bit(63, rw)] //can we see this?
+    bspd_fault: u1,
 }
