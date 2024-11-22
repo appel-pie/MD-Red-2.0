@@ -42,7 +42,7 @@ bind_interrupts!(struct Adc3Irqs {
     ADC3 => adc::InterruptHandler<ADC3>;
 });
 
-/////////////////////////////////Firmware global state data
+/////////////////////////////////Firmware global state
 static RTD_STATE: AtomicBool = AtomicBool::new(false);
 
 /////////////////////////////////Recive Msg Data
@@ -51,8 +51,8 @@ static PDM_STATES: PubSubChannel<ThreadModeRawMutex, u64, 2, 2, 1> = PubSubChann
 ////////////////////////////////Torque Msg Data
 static PM150_COMMAND: PubSubChannel<ThreadModeRawMutex, u64, 2, 1, 2> = PubSubChannel::new();
 
-////////////////////////////////VCU Data for send
-static VCU_DATA: PubSubChannel<ThreadModeRawMutex, u64, 2, 1, 1> = PubSubChannel::new();
+////////////////////////////////VCU General Data
+static VCU_DATA: PubSubChannel<ThreadModeRawMutex, u64, 2, 3, 3> = PubSubChannel::new();
 
 
 /////////////////////////////////Can Addresses: TX
@@ -65,6 +65,18 @@ const CANID_ORIONBMS2: u16 = 0x6B2;          // Receive OrionBMS secondary chann
 const CANID_PDMDATA: u16 = 0x522;           // Receive PDM Water Pump Current and diag
 const CANID_PDMSTATUS: u16 = 0x520;          // Receive pdm vehicle states and faults
 const CANID_M150_TEMPERATURE: u16 = 0x502;   //Receive tractive system temps from m150
+
+//////////////////////////////////sensor calibration
+const THROTTLE_1_OFFSET:i16 = 1000;
+const THROTTLE_2_OFFSET:i16 = 1000;
+const THROTTLE_SIG_RANGE:i16 = 1000;
+const MAX_TORQUE:i16 = 240*10; //scaled for pm150 actual torque *10
+const DISAGREEMENT_THRESHOLD:u16 = 100;
+
+//////////////////////////////////other setpoints
+const BTP_THROTTLE_THRESHOLD:i16 = 20;
+const BTP_BRAKE_THRESHOLD:u16 = 100;
+const BTP_THROTTLE_RESET:i16 = 10;
 
 // Mutex type to safely share CAN bus between tasks
 type CanBusMutType = Mutex<ThreadModeRawMutex, can::Can<'static>>;
@@ -104,6 +116,7 @@ async fn can_write_vcu_data(bus: &'static CanBusMutType) {
 async fn can_read_task(bus: &'static CanBusMutType) {
     info!("CAN Read Task Begin");
     let pdm_states_publish = PDM_STATES.publisher().unwrap();
+
     loop {
         { //nested for mutex lock scope: timer is outside 
         let mut bus_unlock = bus.lock().await; //waits for canbus peri to be free
@@ -115,9 +128,9 @@ async fn can_read_task(bus: &'static CanBusMutType) {
                 if *readframe.header().id() == StandardId::new(CANID_PDMSTATUS).unwrap().into(){
                     pdm_states_publish.publish_immediate(u8arraytou64( readframe.data()));
                     info!("pdm state writted");
-                    if RTD_STATE.load(Ordering::Relaxed) == true && PdmStatesStruct::new_with_raw_value(u8arraytou64(readframe.data())).hv_precharged() == 0{
-                        RTD_STATE.store(false, Ordering::Relaxed); 
-                        info!("shutdown detected");
+                    if RTD_STATE.load(Ordering::Relaxed) && PdmStatesStruct::new_with_raw_value(u8arraytou64(readframe.data())).hv_precharged() == 0{
+                        RTD_STATE.store(false,  Ordering::Relaxed);
+                        info!("shutdown detected"); 
                     }//shutdown detected: immediate rtd set low. This is because i dont want to write some interrup and the other state transition data is all on button pressed interrupt.
                 }else{
                     continue;
@@ -134,27 +147,75 @@ async fn can_read_task(bus: &'static CanBusMutType) {
 #[embassy_executor::task]
 async fn sensor_task(mut adc4: Adc<'static, ADC4>, 
                     mut adc3: Adc<'static, ADC3>,  
-                    mut ain1: AnyAdcChannel<ADC4>, 
-                    mut ain2: AnyAdcChannel<ADC3>) 
+                    mut throttle_1: AnyAdcChannel<ADC4>, 
+                    mut throttle_2: AnyAdcChannel<ADC3>,
+                    mut brake_f: AnyAdcChannel<ADC3>, 
+                    mut brake_r: AnyAdcChannel<ADC3>) 
 {
+let vcu_data = VcuDataStruct::default();
+let publish_vcu_data = VCU_DATA.publisher().unwrap();
+let mut subscribe_vcu_data = VCU_DATA.subscriber().unwrap();
+
+let mut brake_throttle_fault = true;
+let mut throttle_sensors_disagree = true;
+let mut throttle_1_sensor_fault = true;
+let mut throttle_2_sensor_fault = true;
+let mut brake_f_sensor_fault = true;
+let mut brake_r_sensor_fault = true;
+
+{ //reduce scope for mutex
+    publish_vcu_data.publish_immediate(vcu_data.raw_value); //publishes default message
+}
+
 let mc_torque_channel = PM150_COMMAND.publisher().unwrap();
 let mut command_message = McMessageStruct::default();
-let mut brake_throttle_fault = false;
 
 mc_torque_channel.publish_immediate(command_message.raw_value);
     loop {
         Timer::after_millis(50).await;
-        let ain1_reading = adc4.read(&mut ain1).await;// Read the ADC value from the specified pin
-        //info!("AIN1 reading: {}", ain1_reading);
-        let ain2_reading = adc3.read(&mut ain2).await;
-        //info!("AIN2 reading: {}", ain2_reading);
-        command_message = command_message.with_torque_command(((ain1_reading + ain2_reading/2)) as i16);
-        if RTD_STATE.load(Ordering::Relaxed) && !brake_throttle_fault{
+        let vcu_data = VcuDataStruct::new_with_raw_value(subscribe_vcu_data.try_next_message_pure().unwrap_or(vcu_data.raw_value));
+        let throttle_1_reading = adc4.read(&mut throttle_1).await;// Read the ADC value from the specified pin
+        let throttle_2_reading = adc3.read(&mut throttle_2).await;
+        let brake_f_reading = adc3.read(&mut brake_f).await;
+        let brake_r_reading = adc3.read(&mut brake_r).await;
+
+        throttle_1_sensor_fault = throttle_1_reading > 4000 || throttle_1_reading < 10; //////////////////////////sensor faults checked here
+        throttle_2_sensor_fault = throttle_2_reading > 4000 || throttle_2_reading < 10;
+        brake_f_sensor_fault = brake_f_reading > 4000 || brake_f_reading < 10;
+        brake_r_sensor_fault = brake_r_reading > 4000 || brake_r_reading < 10;
+
+        let throttle_1_corrected:i16 = (throttle_1_reading as i16)*-1 + 4095 - THROTTLE_1_OFFSET;
+        let throttle_2_corrected:i16 = (throttle_2_reading as i16)*-1 + 4095 - THROTTLE_2_OFFSET;
+        throttle_sensors_disagree = absolute(throttle_1_corrected-throttle_2_corrected) > DISAGREEMENT_THRESHOLD; //////////sensor agreement checked here
+
+        let throttle_avg = (throttle_1_corrected + throttle_2_corrected)/2; 
+        let mc_throttle = constrain_and_map(throttle_avg, 0, THROTTLE_SIG_RANGE, 0, MAX_TORQUE);
+
+        command_message = command_message.with_torque_command(mc_throttle); 
+    
+        if brake_throttle_fault{
+            brake_throttle_fault = !(mc_throttle<BTP_THROTTLE_RESET && brake_f_reading < BTP_BRAKE_THRESHOLD); //////////////////////brake throttle fault checked here
+        }else{
+            brake_throttle_fault = mc_throttle> BTP_THROTTLE_THRESHOLD && brake_r_reading > BTP_BRAKE_THRESHOLD;
+        }
+
+        if RTD_STATE.load(Ordering::Relaxed)== true  && !brake_throttle_fault && !throttle_sensors_disagree && !throttle_1_sensor_fault && !throttle_2_sensor_fault &&!brake_f_sensor_fault &&!brake_r_sensor_fault{
             command_message = command_message.with_inverter_enable(true.into()); //enable inverter
         }else{
-            command_message = command_message.with_inverter_enable(false.into()); //disable inverter
+            command_message = command_message.with_inverter_enable(false.into()); //disable inverter 
         }
+        /////////////////////////publish command message to canbus task
         mc_torque_channel.publish_immediate(command_message.raw_value);
+
+        /////////////////////////////send failures
+        vcu_data.with_brake_throttle_fault(brake_throttle_fault.into());
+        vcu_data.with_throttle_sensors_disagree(throttle_sensors_disagree.into());
+        vcu_data.with_throttle_1_sensor_fault(throttle_1_sensor_fault.into());
+        vcu_data.with_throttle_2_sensor_fault(throttle_2_sensor_fault.into());
+        vcu_data.with_brake_f_sensor_fault(brake_f_sensor_fault.into());
+        vcu_data.with_brake_r_sensor_fault(brake_r_sensor_fault.into());
+
+        publish_vcu_data.publish_immediate(vcu_data.raw_value);
     }
 }
 
@@ -220,15 +281,18 @@ async fn main(spawner: Spawner) {
     // Spawn tasks
     spawner.spawn(can_write_torque(car_bus_mutex)).unwrap();
     spawner.spawn(can_read_task(car_bus_mutex)).unwrap();
-    spawner.spawn(sensor_task(adc4, adc3, p.PE8.degrade_adc(), p.PE9.degrade_adc())).unwrap();
+    spawner.spawn(sensor_task(adc4, adc3, p.PE8.degrade_adc(), 
+                                         p.PE9.degrade_adc(), 
+                                            p.PE10.degrade_adc(), 
+                                            p.PE11.degrade_adc())).unwrap();
 
     let mut pdmdata = PDM_STATES.subscriber().unwrap();
     let mut pdmstates =  PdmStatesStruct::default();
 
+
     loop {
         //Check if button got pressed
         rtd_button.wait_for_falling_edge().await;
-        info!("button rising edge detected");
         let test = pdmdata.try_next_message_pure();
         if test.is_some(){
             pdmstates = PdmStatesStruct::new_with_raw_value(test.unwrap());
@@ -274,6 +338,24 @@ pub fn i16tou8array(data: &i16, offset_bytes: u8) -> [u8; 8] {
     let temp = temp <<8*offset_bytes;
     output[..8].copy_from_slice(&temp.to_le_bytes()); //copies the memory representation in slices, little endian byte order
     output //returns result
+}
+
+pub fn constrain_and_map(input: i16, lower_bound: i16, upper_bound: i16, lower_map: i16, upper_map: i16) -> i16{
+    let mut constrained =input;
+    if input < lower_bound{
+        constrained = lower_bound;
+    }else if input > upper_bound{
+        constrained = upper_bound;
+    }
+    constrained * (upper_map-lower_map)/(upper_bound-lower_bound) //returned mapped output
+}
+
+pub fn absolute(input: i16)->u16{
+    if input < 0 {
+        (input*-1) as u16
+    }else{
+        input as u16
+    }
 }
 
 #[bitfield(u64, default = 0)]
@@ -330,7 +412,7 @@ struct McMessageStruct {
     shutdown_lock: u8,
 }
 
-#[bitfield(u64, default = 0)]
+#[bitfield(u64, default = 0xFC)] //init internal faults (bits 56 to 61) to high, everything else to zero
 struct VcuDataStruct {
     #[bits(0..=15, rw)]
     front_brake: u16,
@@ -351,19 +433,19 @@ struct VcuDataStruct {
     brake_throttle_fault: u1,
 
     #[bit(57, rw)]
-    throttle_1_sensor_fault: u1,
+    throttle_sensors_disagree: u1,
 
     #[bit(58, rw)]
-    throttle_2_sensor_fault: u1,
+    throttle_1_sensor_fault: u1,
 
     #[bit(59, rw)]
-    brake_1_sensor_fault: u1,
-
+    throttle_2_sensor_fault: u1,
+    
     #[bit(60, rw)]
-    brake_2_sensor_fault: u1,
-
+    brake_f_sensor_fault: u1,
+  
     #[bit(61, rw)]
-    throttle_sensors_disagree: u1,
+    brake_r_sensor_fault: u1,
 
     #[bit(62, rw)]
     rtd_state: u1,
